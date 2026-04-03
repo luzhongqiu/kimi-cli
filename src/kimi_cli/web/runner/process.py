@@ -49,6 +49,8 @@ from kimi_cli.wire.jsonrpc import (
 from kimi_cli.wire.serde import deserialize_wire_message
 
 JSONRPCOutMessageAdapter = TypeAdapter[JSONRPCOutMessage](JSONRPCOutMessage)
+UPLOADS_DIRNAME = "uploads"
+SENT_MARKER_FILENAME = ".sent"
 
 
 class SessionProcess:
@@ -379,13 +381,14 @@ class SessionProcess:
         session = load_session_by_id(self.session_id)
         assert session is not None
 
-        uploads_dir = session.kimi_cli_session.dir / "uploads"
-        if not uploads_dir.exists():
-            return
+        shared_uploads_dir = (
+            Path(str(session.kimi_cli_session.work_dir)).resolve() / UPLOADS_DIRNAME
+        )
+        legacy_uploads_dir = session.kimi_cli_session.dir / UPLOADS_DIRNAME
 
-        # Load .sent marker left by fork to avoid re-sending inherited files.
-        # The marker is kept (not deleted) so it survives process restarts.
-        sent_marker = uploads_dir / ".sent"
+        # Track sent files per session even though the physical uploads now
+        # live in the shared work_dir/uploads directory.
+        sent_marker = legacy_uploads_dir / SENT_MARKER_FILENAME
         if sent_marker.exists():
             try:
                 already_sent = json.loads(sent_marker.read_text(encoding="utf-8"))
@@ -393,10 +396,17 @@ class SessionProcess:
             except Exception:
                 pass
 
-        all_files = sorted(
-            (f for f in uploads_dir.iterdir() if f.name != ".sent"),
-            key=lambda x: x.name,
-        )
+        all_files_by_name: dict[str, Path] = {}
+        for uploads_dir in (shared_uploads_dir, legacy_uploads_dir):
+            if not uploads_dir.exists():
+                continue
+            for file in sorted(
+                (f for f in uploads_dir.iterdir() if f.name != SENT_MARKER_FILENAME),
+                key=lambda x: x.name,
+            ):
+                all_files_by_name.setdefault(file.name, file)
+
+        all_files = [all_files_by_name[name] for name in sorted(all_files_by_name)]
         files = [f for f in all_files if f.name not in self._sent_files]
 
         if not files:
@@ -494,6 +504,11 @@ class SessionProcess:
         # Mark files as sent
         for file in files:
             self._sent_files.add(file.name)
+        try:
+            sent_marker.parent.mkdir(parents=True, exist_ok=True)
+            sent_marker.write_text(json.dumps(sorted(self._sent_files)), encoding="utf-8")
+        except Exception:
+            pass
 
     async def _handle_in_message(self, message: JSONRPCInMessage) -> str | None:
         """Handle inbound message to worker, encoding uploaded files."""

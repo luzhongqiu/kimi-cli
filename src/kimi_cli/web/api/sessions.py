@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse, Response
@@ -92,13 +92,45 @@ SENSITIVE_HOME_PATHS = {
     ".kube",
 }
 CHECKPOINT_USER_PATTERN = re.compile(r"^<system>CHECKPOINT \d+</system>$")
+UPLOADS_DIRNAME = "uploads"
+SENT_MARKER_FILENAME = ".sent"
 
 
 def sanitize_filename(filename: str) -> str:
     """Remove potentially dangerous characters from filename."""
-    # Keep only alphanumeric, dots, underscores, hyphens, and spaces
     safe = "".join(c for c in filename if c.isalnum() or c in "._- ")
     return safe.strip() or "unnamed"
+
+
+def get_work_dir_uploads_dir(kimi_session: KimiCLISession) -> Path:
+    """Return the uploads directory inside the session work directory."""
+    return Path(str(kimi_session.work_dir)).resolve() / UPLOADS_DIRNAME
+
+
+def get_session_uploads_dir(kimi_session: KimiCLISession) -> Path:
+    """Return the session-local uploads directory used for state and legacy files."""
+    return kimi_session.dir / UPLOADS_DIRNAME
+
+
+def get_session_upload_sent_marker(kimi_session: KimiCLISession) -> Path:
+    """Return the marker that records which uploads were already sent for a session."""
+    return get_session_uploads_dir(kimi_session) / SENT_MARKER_FILENAME
+
+
+def reserve_upload_path(directory: Path, filename: str | None) -> Path:
+    """Pick a stable, non-overwriting path for a newly uploaded file."""
+    safe_name = sanitize_filename(filename or "")
+    candidate = directory / safe_name
+    if not candidate.exists():
+        return candidate
+
+    stem, suffix = os.path.splitext(safe_name)
+    counter = 1
+    while True:
+        candidate = directory / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 def get_runner(req: Request) -> KimiCLIRunner:
@@ -388,8 +420,7 @@ async def upload_session_file(
 ) -> UploadSessionFileResponse:
     """Upload a file to a session."""
     session = get_editable_session(session_id, runner)
-    session_dir = session.kimi_cli_session.dir
-    upload_dir = session_dir / "uploads"
+    upload_dir = get_work_dir_uploads_dir(session.kimi_cli_session)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     # Read and validate file size
@@ -400,14 +431,8 @@ async def upload_session_file(
             detail=f"File too large (max {MAX_UPLOAD_SIZE // 1024 // 1024}MB)",
         )
 
-    # Generate safe filename
-    file_name = str(uuid4())
-    if file.filename:
-        safe_name = sanitize_filename(file.filename)
-        name, ext = os.path.splitext(safe_name)
-        file_name = f"{name}_{file_name[:6]}{ext}"
-
-    upload_path = upload_dir / file_name
+    upload_path = reserve_upload_path(upload_dir, file.filename)
+    file_name = upload_path.name
     upload_path.write_bytes(content)
 
     return UploadSessionFileResponse(
@@ -425,7 +450,7 @@ async def get_session_upload_file(
     session_id: UUID,
     path: str,
 ) -> Response:
-    """Get a file from a session's uploads directory."""
+    """Get a file from a session upload directory."""
     session = load_session_by_id(session_id)
     if session is None:
         raise HTTPException(
@@ -433,21 +458,30 @@ async def get_session_upload_file(
             detail="Session not found",
         )
 
-    uploads_dir = (session.kimi_cli_session.dir / "uploads").resolve()
-    if not uploads_dir.exists():
+    upload_roots = [
+        get_work_dir_uploads_dir(session.kimi_cli_session).resolve(),
+        get_session_uploads_dir(session.kimi_cli_session).resolve(),
+    ]
+    existing_roots = [root for root in dict.fromkeys(upload_roots) if root.exists()]
+    if not existing_roots:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Uploads directory not found",
         )
 
-    file_path = (uploads_dir / path).resolve()
-    if not file_path.is_relative_to(uploads_dir):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid path: path traversal not allowed",
-        )
+    file_path: Path | None = None
+    for uploads_dir in existing_roots:
+        candidate = (uploads_dir / path).resolve()
+        if not candidate.is_relative_to(uploads_dir):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid path: path traversal not allowed",
+            )
+        if candidate.exists() and candidate.is_file():
+            file_path = candidate
+            break
 
-    if not file_path.exists() or not file_path.is_file():
+    if file_path is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File not found",
@@ -836,38 +870,45 @@ async def fork_session(
     new_session = await KimiCLISession.create(work_dir=work_dir)
     new_session_dir = new_session.dir
 
-    # Copy only the video files that are actually referenced in the truncated
-    # wire history.  Videos are referenced by path (<video path="...">) and
-    # served via the uploads endpoint, so the physical file must exist.
+    # Videos referenced from history still need a physical file for preview.
+    # New uploads live under work_dir/uploads and are already shared across
+    # forked sessions, so only legacy session-local uploads need copying.
     # Images and text docs are already embedded (base64 / inline) in
     # context.jsonl and don't need the physical file.
-    source_uploads = source_dir / "uploads"
-    if source_uploads.is_dir():
-        # Collect video filenames referenced in the truncated wire.
-        # In the raw JSON lines the pattern looks like: uploads/filename.mp4
-        referenced_videos: set[str] = set()
-        for line in truncated_wire_lines:
-            for match in re.finditer(r"uploads/([^\"\\<>\s]+)", line):
-                fname = match.group(1)
-                mime, _ = mimetypes.guess_type(fname)
-                if mime and mime.startswith("video/"):
-                    referenced_videos.add(fname)
+    referenced_videos: set[str] = set()
+    for line in truncated_wire_lines:
+        for match in re.finditer(r"uploads/([^\"\\<>\s]+)", line):
+            fname = match.group(1)
+            mime, _ = mimetypes.guess_type(fname)
+            if mime and mime.startswith("video/"):
+                referenced_videos.add(fname)
 
-        # Copy only those referenced video files that exist on disk.
-        files_to_copy = [
-            source_uploads / name for name in referenced_videos if (source_uploads / name).is_file()
+    if referenced_videos:
+        source_shared_uploads = get_work_dir_uploads_dir(source_session.kimi_cli_session)
+        source_legacy_uploads = get_session_uploads_dir(source_session.kimi_cli_session)
+        inherited_uploads: set[str] = {
+            name for name in referenced_videos if (source_shared_uploads / name).is_file()
+        }
+
+        legacy_files_to_copy = [
+            source_legacy_uploads / name
+            for name in referenced_videos - inherited_uploads
+            if (source_legacy_uploads / name).is_file()
         ]
-        if files_to_copy:
-            new_uploads = new_session_dir / "uploads"
-            new_uploads.mkdir(parents=True, exist_ok=True)
-            copied_names: list[str] = []
-            for vf in files_to_copy:
-                shutil.copy2(vf, new_uploads / vf.name)
-                copied_names.append(vf.name)
-            # Write a .sent marker so _encode_uploaded_files() won't re-send
-            # these inherited videos.  The marker is kept across process
-            # restarts (not deleted after reading).
-            (new_uploads / ".sent").write_text(json.dumps(copied_names), encoding="utf-8")
+        if legacy_files_to_copy:
+            new_legacy_uploads = get_session_uploads_dir(new_session)
+            new_legacy_uploads.mkdir(parents=True, exist_ok=True)
+            for vf in legacy_files_to_copy:
+                shutil.copy2(vf, new_legacy_uploads / vf.name)
+                inherited_uploads.add(vf.name)
+
+        if inherited_uploads:
+            sent_marker = get_session_upload_sent_marker(new_session)
+            sent_marker.parent.mkdir(parents=True, exist_ok=True)
+            sent_marker.write_text(
+                json.dumps(sorted(inherited_uploads)),
+                encoding="utf-8",
+            )
 
     # Write truncated wire.jsonl
     new_wire_path = new_session_dir / "wire.jsonl"
